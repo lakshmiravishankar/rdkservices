@@ -46,13 +46,13 @@
 #include "UtilsString.h"
 
 #ifdef RDKSHELL_READ_MAC_ON_STARTUP
-#include "FactoryProtectHal.h"
+#include "DeviceMode.h"
 #endif //RDKSHELL_READ_MAC_ON_STARTUP
 
 
 #define API_VERSION_NUMBER_MAJOR 1
 #define API_VERSION_NUMBER_MINOR 4
-#define API_VERSION_NUMBER_PATCH 3
+#define API_VERSION_NUMBER_PATCH 6
 
 const string WPEFramework::Plugin::RDKShell::SERVICE_NAME = "org.rdk.RDKShell";
 //methods
@@ -141,10 +141,6 @@ const string WPEFramework::Plugin::RDKShell::RDKSHELL_METHOD_GET_AV_BLOCKED_APPS
 const string WPEFramework::Plugin::RDKShell::RDKSHELL_METHOD_KEY_REPEAT_CONFIG = "keyRepeatConfig";
 const string WPEFramework::Plugin::RDKShell::RDKSHELL_METHOD_GET_GRAPHICS_FRAME_RATE = "getGraphicsFrameRate";
 const string WPEFramework::Plugin::RDKShell::RDKSHELL_METHOD_SET_GRAPHICS_FRAME_RATE = "setGraphicsFrameRate";
-#ifdef HIBERNATE_SUPPORT_ENABLED
-const string WPEFramework::Plugin::RDKShell::RDKSHELL_METHOD_CHECKPOINT = "checkpoint";
-const string WPEFramework::Plugin::RDKShell::RDKSHELL_METHOD_RESTORE = "restore";
-#endif
 
 const string WPEFramework::Plugin::RDKShell::RDKSHELL_EVENT_ON_USER_INACTIVITY = "onUserInactivity";
 const string WPEFramework::Plugin::RDKShell::RDKSHELL_EVENT_ON_APP_LAUNCHED = "onApplicationLaunched";
@@ -166,10 +162,6 @@ const string WPEFramework::Plugin::RDKShell::RDKSHELL_EVENT_DEVICE_CRITICALLY_LO
 const string WPEFramework::Plugin::RDKShell::RDKSHELL_EVENT_ON_EASTER_EGG = "onEasterEgg";
 const string WPEFramework::Plugin::RDKShell::RDKSHELL_EVENT_ON_WILL_DESTROY = "onWillDestroy";
 const string WPEFramework::Plugin::RDKShell::RDKSHELL_EVENT_ON_SCREENSHOT_COMPLETE = "onScreenshotComplete";
-#ifdef HIBERNATE_SUPPORT_ENABLED
-const string WPEFramework::Plugin::RDKShell::RDKSHELL_EVENT_ON_CHECKPOINTED = "onCheckpointed";
-const string WPEFramework::Plugin::RDKShell::RDKSHELL_EVENT_ON_RESTORED = "onRestored";
-#endif
 
 using namespace std;
 using namespace RdkShell;
@@ -196,11 +188,6 @@ bool sFactoryModeBlockResidentApp = false;
 bool sForceResidentAppLaunch = false;
 static bool sRunning = true;
 bool needsScreenshot = false;
-
-#ifdef HIBERNATE_NATIVE_APPS_ON_SUSPENDED
-std::mutex nativeAppWasResumedMutex;
-map<string,bool> nativeAppWasResumed;
-#endif
 
 #define ANY_KEY 65536
 #define RDKSHELL_THUNDER_TIMEOUT 20000
@@ -245,6 +232,22 @@ enum AppLastExitReason
     CRASH,
     DEACTIVATED
 };
+
+#ifdef RDKSHELL_READ_MAC_ON_STARTUP
+static bool checkFactoryMode_wrapper()
+{
+        Device_Mode_DeviceModes_t deviceMode;
+        bool ret = false;
+        Device_Mode_Result_t result = Device_Mode_getDeviceMode(&deviceMode);
+        if(result == DEVICE_MODE_RESULT_SUCCESS) {
+                if (deviceMode == DEVICE_MODE_FACTORY) {
+                        std::cout << "Device in FactoryMode\n";
+                        ret = true;
+                }
+        }
+        return ret;
+}
+#endif
 
 FactoryAppLaunchStatus sFactoryAppLaunchStatus = NOTLAUNCHED;
 
@@ -583,38 +586,7 @@ namespace WPEFramework {
                 JsonObject params;
                 params["client"] = mCallSign;
                 mRDKShell.notify(RDKShell::RDKSHELL_EVENT_ON_PLUGIN_SUSPENDED, params);
-
-#ifdef HIBERNATE_NATIVE_APPS_ON_SUSPENDED
-                RFC_ParamData_t param;
-                if (Utils::getRFCConfig("Device.DeviceInfo.X_RDKCENTRAL-COM_RFC.Feature.AppHibernate.Enable", param)
-                    && strncasecmp(param.value, "true", 4) == 0)
-                {
-                    nativeAppWasResumedMutex.lock();
-                    if ((mCallSign.find("Netflix") != std::string::npos || mCallSign.find("Cobalt") != std::string::npos)
-                        && nativeAppWasResumed.find(mCallSign) != nativeAppWasResumed.end()
-                        && nativeAppWasResumed[mCallSign])
-                    {
-                        // call RDKShell.checkpoint
-                        std::thread requestsThread =
-                            std::thread([=]()
-                                        {
-                        JsonObject checkpointParams;
-                        JsonObject checkpointResponse;
-                        checkpointParams["callsign"] = mCallSign;
-                        mRDKShell.getThunderControllerClient("org.rdk.RDKShell.1")->Invoke<JsonObject, JsonObject>(0, "checkpoint", checkpointParams, checkpointResponse); });
-
-                        requestsThread.detach();
-                    }
-                    nativeAppWasResumedMutex.unlock();
-                }
-#endif
-            }
-#ifdef HIBERNATE_NATIVE_APPS_ON_SUSPENDED
-            nativeAppWasResumedMutex.lock();
-            nativeAppWasResumed[mCallSign] = (state == PluginHost::IStateControl::RESUMED);
-            nativeAppWasResumedMutex.unlock();
-#endif
-
+            }            
           }
 
           BEGIN_INTERFACE_MAP(Notification)
@@ -906,122 +878,12 @@ namespace WPEFramework {
 	    return ignoreLaunch;
 	}
 
-         void RDKShell::MonitorClients::handleInitialize(PluginHost::IShell* service)
-        {
-                if(service)
-                {
-                   std::string configLine = service->ConfigLine();
-                   if (configLine.empty())
-                   {
-                       return;
-                   }
-                   JsonObject serviceConfig = JsonObject(configLine.c_str());
-                   if (serviceConfig.HasLabel("clientidentifier"))
-                   {
-                       std::string clientidentifier = serviceConfig["clientidentifier"].String();
-                      std::string serviceCallsign = service->Callsign();
-                       if ((serviceCallsign == RESIDENTAPP_CALLSIGN) && ignoreResidentAppLaunch())
-                       {
-                           std::cout << "Resident app activation early !!! " << std::endl;
-                           return;
-                       }
-                       if (!isClientExists(serviceCallsign))
-                       {
-                           std::shared_ptr<CreateDisplayRequest> request = std::make_shared<CreateDisplayRequest>(serviceCallsign, clientidentifier);
-                           gRdkShellMutex.lock();
-                           gCreateDisplayRequests.push_back(request);
-                           gRdkShellMutex.unlock();
-                           sem_wait(&request->mSemaphore);
-                       }
-                       gRdkShellMutex.lock();
-                       RdkShell::CompositorController::addListener(clientidentifier, mShell.mEventListener);
-                       gRdkShellMutex.unlock();
-                       gPluginDataMutex.lock();
-                       std::string className = service->ClassName();
-                       PluginData pluginData;
-                       pluginData.mClassName = className;
-                       if (gActivePluginsData.find(serviceCallsign) == gActivePluginsData.end())
-                       {
-                           gActivePluginsData[serviceCallsign] = pluginData;
-                       }
-                       gPluginDataMutex.unlock();
-                   }
-                }
-           }      
- 
-        void  RDKShell::MonitorClients::handleActivated(PluginHost::IShell* service)
-        {
-                if(service)
-                {
-                        if(service->Callsign() == RESIDENTAPP_CALLSIGN)
-                        {
-                                bool ignoreLaunch = ignoreResidentAppLaunch(true);
-                                if (ignoreLaunch)
-                                {
-                                  std::cout << "deactivating resident app as factory mode is set" << std::endl;
-                                  JsonObject destroyRequest;
-                                 destroyRequest["callsign"] = "ResidentApp";
-                                  RDKShellApiRequest apiRequest;
-                                  apiRequest.mName = "destroy";
-                                  apiRequest.mRequest = destroyRequest;
-                                  RDKShell* rdkshellPlugin = RDKShell::_instance;
-                                   rdkshellPlugin->launchRequestThread(apiRequest);
-                                }
-                        }
-                        else if(service->Callsign() == PERSISTENT_STORE_CALLSIGN && !sPersistentStoreFirstActivated)
-                        {
-                                std::cout << "persistent store activated\n";
-                                gRdkShellMutex.lock();
-                                sPersistentStoreFirstActivated = true;
-                                gRdkShellMutex.unlock();
-                        }
-                        else if(service->Callsign() == SYSTEM_SERVICE_CALLSIGN)
-                        {
-                                RDKShellApiRequest apiRequest;
-                        apiRequest.mName = "susbscribeSystemEvent";
-                        RDKShell* rdkshellPlugin = RDKShell::_instance;
-                        rdkshellPlugin->launchRequestThread(apiRequest);
-                        }
-                }
-        }
-
-
         void RDKShell::MonitorClients::handleDeactivated(PluginHost::IShell* service)
         {
             if (service)
             {
-		gLaunchDestroyMutex.lock();
-                if (gDestroyApplications.find(service->Callsign()) == gDestroyApplications.end())
-                {
-                     gExternalDestroyApplications[service->Callsign()] = true;
-                }
-                    gLaunchDestroyMutex.unlock();
-                    StateControlNotification* notification = nullptr;
-                    gPluginDataMutex.lock();
-                    auto notificationIt = gStateNotifications.find(service->Callsign());
-                    if (notificationIt != gStateNotifications.end())
-                    {
-                        notification = notificationIt->second;
-                        gStateNotifications.erase(notificationIt);
-                    }
-                    gPluginDataMutex.unlock();
-                    if (notification)
-                    {
-                        PluginHost::IStateControl* stateControl(service->QueryInterface<PluginHost::IStateControl>());
-                        if (stateControl != nullptr)
-                        {
-                            stateControl->Unregister(notification);
-                            stateControl->Release();
-                        }
-                        notification->Release();
-                    }
                 gExitReasonMutex.lock();
                 gApplicationsExitReason[service->Callsign()] = AppLastExitReason::DEACTIVATED;
-#ifdef HIBERNATE_NATIVE_APPS_ON_SUSPENDED
-          nativeAppWasResumedMutex.lock();
-          nativeAppWasResumed[service->Callsign()] = false;
-          nativeAppWasResumedMutex.unlock();
-#endif
                 if(service->Reason() == PluginHost::IShell::FAILURE)
                 {
                     gApplicationsExitReason[service->Callsign()] = AppLastExitReason::CRASH;
@@ -1085,11 +947,6 @@ namespace WPEFramework {
                 if ((currentState == PluginHost::IShell::DEACTIVATED) || (currentState == PluginHost::IShell::DESTROYED))
                 {
                      gApplicationsExitReason[service->Callsign()] = AppLastExitReason::DEACTIVATED;
-#ifdef HIBERNATE_NATIVE_APPS_ON_SUSPENDED
-                    nativeAppWasResumedMutex.lock();
-                    nativeAppWasResumed[service->Callsign()] = false;
-                    nativeAppWasResumedMutex.unlock();
-#endif
                 }
                 if(service->Reason() == PluginHost::IShell::FAILURE)
                 {
@@ -1254,21 +1111,22 @@ namespace WPEFramework {
         }
 
 #ifdef USE_THUNDER_R4
-       void RDKShell::MonitorClients::Initialize(VARIABLE_IS_NOT_USED const string& callsign, VARIABLE_IS_NOT_USED PluginHost::IShell* service)
+       void RDKShell::MonitorClients::Activation(const string& callsign, PluginHost::IShell* service)
        {
-             handleInitialize(service);
+           StateChange(service);
        }
        void RDKShell::MonitorClients::Activated(const string& callsign, PluginHost::IShell* service)
        {
-            handleActivated(service);
+            StateChange(service);
+       }
+       void RDKShell::MonitorClients::Deactivation(const string& callsign, PluginHost::IShell* service)
+       {
+           StateChange(service);
        }
        void RDKShell::MonitorClients::Deactivated(const string& callsign, PluginHost::IShell* service)
        {
+            //StateChange(service);
             handleDeactivated(service);
-       }
-       void RDKShell::MonitorClients::Deinitialized(VARIABLE_IS_NOT_USED const string& callsign, VARIABLE_IS_NOT_USED PluginHost::IShell* service)
-       {
-
        }
        void RDKShell::MonitorClients::Unavailable(const string& callsign, PluginHost::IShell* service)
        {}
@@ -1396,10 +1254,6 @@ namespace WPEFramework {
             Register(RDKSHELL_METHOD_SET_GRAPHICS_FRAME_RATE, &RDKShell::setGraphicsFrameRateWrapper, this);
             Register(RDKSHELL_METHOD_SET_AV_BLOCKED, &RDKShell::setAVBlockedWrapper, this);
             Register(RDKSHELL_METHOD_GET_AV_BLOCKED_APPS, &RDKShell::getBlockedAVApplicationsWrapper, this);
-#ifdef HIBERNATE_SUPPORT_ENABLED
-            Register(RDKSHELL_METHOD_CHECKPOINT, &RDKShell::checkpointWrapper, this);
-            Register(RDKSHELL_METHOD_RESTORE, &RDKShell::restoreWrapper, this);
-#endif
       	    m_timer.connect(std::bind(&RDKShell::onTimer, this));
         }
 
@@ -1427,27 +1281,8 @@ namespace WPEFramework {
             bool factoryMacMatched = false;
 #ifdef RFC_ENABLED
             #ifdef RDKSHELL_READ_MAC_ON_STARTUP
-            char* mac = new char[19];
-            tFHError retAPIStatus;
-            std::cout << "calling factory hal init\n";
-            factorySD1_init();
-            retAPIStatus = getEthernetMAC(mac);
-            if(retAPIStatus == E_OK)
-            {
-                if (strncasecmp(mac,"00:00:00:00:00:00",17) == 0)
-                {
-                    std::cout << "launching factory app as mac is matching... " << std::endl;
-                    factoryMacMatched = true;
-                }
-                else
-                {
-                    std::cout << "mac match failed... mac from hal - " << mac << std::endl;
-                }
-            }
-            else
-            {
-                std::cout << "reading stb mac hal api failed... " << std::endl;
-            }
+	    Device_Mode_Init();
+            factoryMacMatched = checkFactoryMode_wrapper();
             #else
             RFC_ParamData_t macparam;
             bool macret = Utils::getRFCConfig("Device.DeviceInfo.X_COMCAST-COM_STB_MAC", macparam);
@@ -2389,18 +2224,6 @@ namespace WPEFramework {
                 // Get the client mime type
                 std::string mimeType;
                 getMimeType(client, mimeType);
-
-#ifdef HIBERNATE_SUPPORT_ENABLED
-                // RDKShell::kill only destroys wayland display
-                // and hibernated app will not detect missing display.
-                // Wakeup app by getting its state
-                WPEFramework::Core::JSON::String stateString;
-                auto thunderPlugin = getThunderControllerClient(client);
-                if(thunderPlugin)
-                {
-                    thunderPlugin->Get<WPEFramework::Core::JSON::String>(RDKSHELL_THUNDER_TIMEOUT, "state", stateString);
-                }
-#endif
 
                 // Kill the display
                 result = kill(client);
@@ -4976,38 +4799,17 @@ namespace WPEFramework {
                         {
                             std::string callsign;
                             service.Callsign.ToString(callsign);
-
                             callsign.erase(std::remove(callsign.begin(),callsign.end(),'\"'),callsign.end());
+
                             WPEFramework::Core::JSON::String stateString;
                             const string callsignWithVersion = callsign + ".1";
-                            uint32_t stateStatus = 0;
-
-#ifdef HIBERNATE_SUPPORT_ENABLED
-                            if(service.JSONState != PluginHost::MetaData::Service::state::HIBERNATED)
-                            {
-#endif
-                                stateStatus = getThunderControllerClient(callsignWithVersion)->Get<WPEFramework::Core::JSON::String>(RDKSHELL_THUNDER_TIMEOUT, "state", stateString);
-#ifdef HIBERNATE_SUPPORT_ENABLED
-                            }
-                            else
-                            {
-                                stateString = "checkpointed";
-                            }
-#endif
-
+                            auto thunderPlugin = getThunderControllerClient(callsignWithVersion);
+                            uint32_t stateStatus = thunderPlugin->Get<WPEFramework::Core::JSON::String>(RDKSHELL_THUNDER_TIMEOUT, "state", stateString);
 
                             if (stateStatus == 0)
                             {
                                 WPEFramework::Core::JSON::String urlString;
-                                uint32_t urlStatus = 1;
-#ifdef HIBERNATE_SUPPORT_ENABLED
-                                if(service.JSONState != PluginHost::MetaData::Service::state::HIBERNATED)
-                                {
-#endif
-                                    urlStatus = getThunderControllerClient(callsignWithVersion)->Get<WPEFramework::Core::JSON::String>(RDKSHELL_THUNDER_TIMEOUT, "url",urlString);
-#ifdef HIBERNATE_SUPPORT_ENABLED
-                                }
-#endif
+                                uint32_t urlStatus = thunderPlugin->Get<WPEFramework::Core::JSON::String>(RDKSHELL_THUNDER_TIMEOUT, "url",urlString);
 
                                 JsonObject typeObject;
                                 typeObject["callsign"] = callsign;
@@ -6112,120 +5914,6 @@ namespace WPEFramework {
             returnResponse(status);
         }
 
-#ifdef HIBERNATE_SUPPORT_ENABLED
-        uint32_t RDKShell::checkpointWrapper(const JsonObject& parameters, JsonObject& response)
-        {
-            LOGINFOMETHOD();
-            bool status = false;
-            if (parameters.HasLabel("callsign"))
-            {
-                std::string callsign = parameters["callsign"].String();
-                bool isApplicationBeingDestroyed = false;
-
-                gLaunchDestroyMutex.lock();
-                if (gDestroyApplications.find(callsign) != gDestroyApplications.end())
-                {
-                    isApplicationBeingDestroyed = true;
-                }
-                if (gExternalDestroyApplications.find(callsign) != gExternalDestroyApplications.end())
-                {
-                    isApplicationBeingDestroyed = true;
-                }
-                gLaunchDestroyMutex.unlock();
-
-                if (isApplicationBeingDestroyed)
-                {
-                    std::cout << "ignoring checkpoint for " << callsign << " as it is being destroyed " << std::endl;
-                    status = false;
-                    response["message"] = "failed to checkpoint application, is being destroyed";
-                    returnResponse(status);
-                }
-
-                if( callsign.find("Netflix") != string::npos || callsign.find("Cobalt") != string::npos )
-                {
-                    //Check if native app is suspended
-                    WPEFramework::Core::JSON::String stateString;
-                    const string callsignWithVersion = callsign + ".1";
-                    auto thunderPlugin = getThunderControllerClient(callsignWithVersion);
-                    uint32_t stateStatus = 0;
-                    stateStatus = thunderPlugin->Get<WPEFramework::Core::JSON::String>(RDKSHELL_THUNDER_TIMEOUT, "state", stateString);
-                    if(stateStatus || stateString != "suspended")
-                    {
-                        std::cout << "ignoring checkpoint for " << callsign << " as it is not suspended " << std::endl;
-                        status = false;
-                        response["message"] = "failed to checkpoint native application, not suspended";
-                        returnResponse(status);
-                    }
-                }
-
-                std::thread requestsThread =
-                std::thread([=]()
-                {
-                    auto thunderController = RDKShell::getThunderControllerClient();
-                    JsonObject request, result, eventMsg;
-                    request["callsign"] = callsign;
-                    request["timeout"] = RDKSHELL_THUNDER_TIMEOUT;
-                    if(parameters.HasLabel("timeout"))
-                    {
-                        request["timeout"] = parameters["timeout"];
-                    }
-                    if(parameters.HasLabel("procsequence"))
-                    {
-                        request["procsequence"] = parameters["procsequence"];
-                    }
-                    uint32_t errCode = thunderController->Invoke<JsonObject, JsonObject>(RDKSHELL_THUNDER_TIMEOUT, "hibernate", request, result);
-                    if(errCode > 0)
-                    {
-                        eventMsg["success"] = false;
-                        eventMsg["message"] = result;
-                    }
-                    else
-                    {
-                        eventMsg["success"] = true;
-                    }
-                    notify(RDKShell::RDKSHELL_EVENT_ON_CHECKPOINTED, eventMsg);
-                });
-                requestsThread.detach();
-                status = true;
-            }
-
-            returnResponse(status);
-        }
-
-        uint32_t RDKShell::restoreWrapper(const JsonObject& parameters, JsonObject& response)
-        {
-            LOGINFOMETHOD();
-            bool status = false;
-            if (parameters.HasLabel("callsign"))
-            {
-                std::string callsign = parameters["callsign"].String();
-                std::thread requestsThread =
-                std::thread([=]()
-                {
-                    auto thunderController = RDKShell::getThunderControllerClient();
-                    JsonObject request, result, eventMsg;
-                    request["callsign"] = callsign;
-
-                    uint32_t errCode = thunderController->Invoke<JsonObject, JsonObject>(RDKSHELL_THUNDER_TIMEOUT, "activate", request, result);
-                    if(errCode > 0)
-                    {
-                        eventMsg["success"] = false;
-                        eventMsg["message"] = result;
-                    }
-                    else
-                    {
-                        eventMsg["success"] = true;
-                    }
-                    notify(RDKShell::RDKSHELL_EVENT_ON_RESTORED, eventMsg);
-                });
-                requestsThread.detach();
-                status = true;
-            }
-
-            returnResponse(status);
-        }
-#endif
-
         // Registered methods end
 
         // Events begin
@@ -6240,25 +5928,15 @@ namespace WPEFramework {
             std::cout << "inside of checkForBootupFactoryAppLaunch\n";
 #ifdef RFC_ENABLED
             #ifdef RDKSHELL_READ_MAC_ON_STARTUP
-            char* mac = new char[19];
-            tFHError retAPIStatus;
-            retAPIStatus = getEthernetMAC(mac);
-            if(retAPIStatus == E_OK)
-            {
-                if (strncasecmp(mac,"00:00:00:00:00:00",17) == 0)
-                {
-                    std::cout << "launching factory app as mac is matching... " << std::endl;
-                    return true;
-                }
-                else
-                {
-                    std::cout << "mac match failed... mac from hal - " << mac << std::endl;
-                }
-            }
-            else
-            {
-                std::cout << "reading stb mac via hal failed " << std::endl;
-            }
+	    if (checkFactoryMode_wrapper())
+	    {
+		    std::cout << "Device in FactoryMode\n";
+		    return true;
+	    }
+	    else
+	    {
+		    std::cout << "Device in User mode\n";
+	    }
             #else
             RFC_ParamData_t param;
             bool ret = Utils::getRFCConfig("Device.DeviceInfo.X_COMCAST-COM_STB_MAC", param);
